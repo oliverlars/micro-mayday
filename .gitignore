@@ -1,0 +1,5 @@
+build/*.o
+build.sh
+compile_commands.json
+.vscode
+.cache
