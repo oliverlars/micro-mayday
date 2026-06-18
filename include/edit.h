@@ -15,9 +15,7 @@ typedef struct cursor
 	v2i Selection;
 
 	int VisualX;
-
-	struct cursor *Next;
-	struct cursor *Previous;
+	
 } cursor;
 
 typedef enum undo_type
@@ -73,7 +71,9 @@ typedef struct edit_context
 	undo_stack *NewestAction;
 	undo_stack *OldestAction;
 
+
 	cursor *Cursors;
+	int     CursorCount;
 
 	u8 *ScratchChunk;
 
@@ -164,9 +164,8 @@ int E_GetMaxTextWidthFromRange(edit_context *E, draw_context *D,
 int E_IndexFromVisualXAndLineStart(edit_context *E, draw_context *D, d_font Font,
 								   editable_buffer *Buffer, int VisualX, int LineStart);
 
-int E_CursorCount(cursor *Cursor);
-cursor *E_LastCursor(cursor *Cursor);
-void E_AppendCursor(edit_context *Edit, m_arena *Arena, cursor *Cursor, cursor NextCursor);
+cursor *E_LastCursor(edit_context *Edit);
+void E_AppendCursor(edit_context *Edit, m_arena *Arena, cursor Cursor);
 
 void PushUndoAction(edit_context *E,
 					m_arena *Arena,

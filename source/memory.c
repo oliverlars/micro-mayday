@@ -72,11 +72,6 @@ void MemoryCommit(void *Address, s64 NumberOfBytes)
 	mprotect(Address, NumberOfBytes, PROT_READ|PROT_WRITE);
 }
 
-void MemoryCopy(void *Destination, void *Source, s64 NumberOfBytes)
-{
-	memcpy(Destination, Source, NumberOfBytes);
-}
-
 void MemoryZero(void *Destination, s64 NumberOfBytes)
 {
 	memset(Destination, 0, NumberOfBytes);

@@ -39,7 +39,7 @@ u64 AlignUp(u64 Pointer, u64 Alignment);
 
 void MemorySet(void *Destination, int Byte, s64 NumberOfBytes);
 b32 MemoryEqual(void *A, void *B, s64 NumberOfBytes);
-void MemoryCopy(void *Destination, void *Source, s64 NumberOfBytes);
+#define MemoryCopy(Destination, Source, NumberOfBytes) __builtin_memcpy(Destination, Source, NumberOfBytes)
 u8* MemoryReserve(s64 NumberOfBytes);
 void MemoryCommit(void *Address, s64 NumberOfBytes);
 void MemoryZero(void *Destination, s64 NumberOfBytes);

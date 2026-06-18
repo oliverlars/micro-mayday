@@ -49,11 +49,16 @@ void E_DeleteTo(edit_context *Edit, cursor *Cursor, editable_buffer *Buffer)
 {
 	assert(Edit->ScratchChunk);
 
+	u64 Start = OS_TimeStampNow();
+
 	int ReadPos = 0;
 	int WritePos = 0;
+	int TotalBytesCopied = 0;
+	int CursorCount = 0;
 
-	for(cursor *C = Cursor; C; C = C->Next)
+	for(int I = 0; I < Edit->CursorCount; I++)
 	{
+		cursor *C = Edit->Cursors + I;
 		v2i Selection = E_GetSortedSelection(C->Selection);
 
 		int DeleteStart;
@@ -71,17 +76,16 @@ void E_DeleteTo(edit_context *Edit, cursor *Cursor, editable_buffer *Buffer)
 
 		// Copy source text before this cursor's delete range
 		int CopySize = DeleteStart - ReadPos;
-		if(CopySize > 0)
-		{
-			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, CopySize);
-			WritePos += CopySize;
-		}
+		MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, CopySize);
+		WritePos += CopySize;
+		TotalBytesCopied += CopySize;
 
 		// Update cursor position
 		C->Selection = v2i(WritePos, WritePos);
 
 		// Skip over deleted range in source
 		ReadPos = DeleteEnd;
+		CursorCount++;
 	}
 
 	// Copy remaining source text after last cursor
@@ -90,7 +94,13 @@ void E_DeleteTo(edit_context *Edit, cursor *Cursor, editable_buffer *Buffer)
 	{
 		MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, Remaining);
 		WritePos += Remaining;
+		TotalBytesCopied += Remaining;
 	}
+
+	Edit->DebugBytesCopied = TotalBytesCopied;
+	Edit->DebugBytesInserted = 0;
+	Edit->DebugCursorCount = CursorCount;
+	Edit->DebugTimeMs = OS_MilliSecondsFromTimeStamp(OS_TimeStampNow() - Start);
 
 	// Swap temp and source
 	u8 *Swap = Buffer->Chunk;
@@ -105,37 +115,74 @@ void E_InsertTo(edit_context *Edit, cursor *Cursor, editable_buffer *Buffer, str
 
 	u64 Start = OS_TimeStampNow();
 
+	int Count = Edit->CursorCount;
+	int InsertSize = (int)TextToInsert.Size;
+
+	// The inserted text is almost always a single typed character. Store it
+	// directly to avoid a memcpy call per cursor.
+	b32 SingleByte = (InsertSize == 1);
+	u8  InsertByte = SingleByte ? TextToInsert.Bytes[0] : 0;
+
+	// Single pass: copy the gap before each cursor, then splice the inserted
+	// text. WritePos/ReadPos carry between iterations, but that chain is just a
+	// couple of integer adds - the copies themselves are the work.
 	int ReadPos = 0;
 	int WritePos = 0;
 	int TotalBytesCopied = 0;
-	int TotalBytesInserted = 0;
-	int CursorCount = 0;
-
-	for(cursor *C = Cursor; C; C = C->Next)
+	for(int I = 0; I < Count; I++)
 	{
+		cursor *C = Edit->Cursors + I;
 		v2i Selection = E_GetSortedSelection(C->Selection);
 
-		// Copy source text before this cursor
 		int CopySize = Selection.X - ReadPos;
-		if(CopySize > 0)
+		if(CopySize >= 64) MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, CopySize);
+		else if(CopySize >= 32)
 		{
-			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, CopySize);
-			WritePos += CopySize;
-			TotalBytesCopied += CopySize;
+			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, 32);
+			MemoryCopy(Edit->ScratchChunk + WritePos + CopySize - 32, Buffer->Chunk + ReadPos + CopySize - 32, 32);
 		}
+		else if(CopySize >= 16)
+		{
+			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, 16);
+			MemoryCopy(Edit->ScratchChunk + WritePos + CopySize - 16, Buffer->Chunk + ReadPos + CopySize - 16, 16);
+		}
+		else if(CopySize >= 8)
+		{
+			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, 8);
+			MemoryCopy(Edit->ScratchChunk + WritePos + CopySize - 8, Buffer->Chunk + ReadPos + CopySize - 8, 8);
+		}
+		else if(CopySize >= 4)
+		{
+			MemoryCopy(Edit->ScratchChunk + WritePos, Buffer->Chunk + ReadPos, 4);
+			MemoryCopy(Edit->ScratchChunk + WritePos + CopySize - 4, Buffer->Chunk + ReadPos + CopySize - 4, 4);
+		}
+		else if(CopySize == 3)
+		{
+			Edit->ScratchChunk[WritePos + 0] = Buffer->Chunk[ReadPos + 0];
+			Edit->ScratchChunk[WritePos + 1] = Buffer->Chunk[ReadPos + 1];
+			Edit->ScratchChunk[WritePos + 2] = Buffer->Chunk[ReadPos + 2];
+		}
+		else if(CopySize == 2)
+		{
+			Edit->ScratchChunk[WritePos + 0] = Buffer->Chunk[ReadPos + 0];
+			Edit->ScratchChunk[WritePos + 1] = Buffer->Chunk[ReadPos + 1];
+		}
+		else
+		{
+			Edit->ScratchChunk[WritePos] = Buffer->Chunk[ReadPos];
+		}
+		WritePos += CopySize;
+		TotalBytesCopied += CopySize;
 
-		// Insert text
-		MemoryCopy(Edit->ScratchChunk + WritePos, TextToInsert.Bytes, TextToInsert.Size);
-		WritePos += TextToInsert.Size;
-		TotalBytesInserted += TextToInsert.Size;
+		if(SingleByte) Edit->ScratchChunk[WritePos] = InsertByte;
+		else MemoryCopy(Edit->ScratchChunk + WritePos, TextToInsert.Bytes, InsertSize);
+		WritePos += InsertSize;
 
-		// Update cursor to after inserted text
 		C->Selection = v2i(WritePos, WritePos);
-
-		// Skip over selection range in source (collapse)
 		ReadPos = Selection.Y;
-		CursorCount++;
 	}
+
+	int TotalBytesInserted = Count * InsertSize;
 
 	// Copy remaining source text after last cursor
 	int Remaining = Buffer->Length - ReadPos;
@@ -148,7 +195,7 @@ void E_InsertTo(edit_context *Edit, cursor *Cursor, editable_buffer *Buffer, str
 
 	Edit->DebugBytesCopied = TotalBytesCopied;
 	Edit->DebugBytesInserted = TotalBytesInserted;
-	Edit->DebugCursorCount = CursorCount;
+	Edit->DebugCursorCount = Edit->CursorCount;
 	Edit->DebugTimeMs = OS_MilliSecondsFromTimeStamp(OS_TimeStampNow() - Start);
 
 	// Swap temp and source
@@ -173,8 +220,9 @@ void E_MoveCursors(edit_context *Edit, draw_context *Draw,
 				   edit_movement Movement, edit_move_type MoveType)
 {
 	if(Movement == E_MOVE_NONE) return;
-	for(;Cursor; Cursor = Cursor->Next)
+	for(int I = 0; I < Edit->CursorCount; I++)
 	{
+		Cursor = Edit->Cursors + I;
 		v2i Selection = Cursor->Selection;
 		b32 IsInSelection = Cursor->Selection.X != Cursor->Selection.Y;
 		if(Movement == E_MOVE_LEFT && IsInSelection && MoveType == E_MOVE_NOT_SELECTING)
@@ -375,13 +423,16 @@ v2f E_GetPositionFromEditableBuffer(edit_context *E,
 	return Result;
 }
 
-v2f E_GetVisualPositionFromEditableBuffer(edit_context *E,
-									draw_context *D,
-									int Index,
-									editable_buffer Buffer,
-									d_font Font,
-									v2i Indices,
-									v2f Position)
+v2f E_GetVisualPositionFromEditableBuffer
+(
+	edit_context *E,
+	draw_context *D,
+	int Index,
+	editable_buffer Buffer,
+	d_font Font,
+	v2i Indices,
+	v2f Position
+)
 {
 	f32 Scale = stbtt_ScaleForPixelHeight(&Font.Info, Buffer.HeightInPixels);
 
@@ -618,30 +669,14 @@ int E_VisualXFromIndex(edit_context *Edit, draw_context *Draw,
 	return E_GetMaxTextWidthFromRange(Edit, Draw, Font,  Buffer, LineStart, Index);
 }
 
-cursor *E_LastCursor(cursor *Cursor)
+cursor *E_LastCursor(edit_context *Edit)
 {
-	for(;Cursor->Next; Cursor = Cursor->Next);
-	return Cursor;
+	return Edit->Cursors + Edit->CursorCount - 1;
 }
 
-int E_CursorCount(cursor *Cursor)
+void E_AppendCursor(edit_context *Edit, m_arena *Arena, cursor Cursor)
 {
-	int Result = 0;
-	for(; Cursor; Cursor = Cursor->Next)
-	{
-		Result++;
-	}
-	return Result;
-}
-
-void E_AppendCursor(edit_context *Edit, m_arena *Arena, cursor *Cursor, cursor NextCursor)
-{
-	assert(Cursor);
-	Cursor = E_LastCursor(Cursor);
-
-	Cursor->Next = ArenaPushArrayZero(Arena, cursor, 1);
-	NextCursor.Previous = Cursor;
-	Cursor->Next[0] = NextCursor;
+	Edit->Cursors[Edit->CursorCount++] = Cursor;
 }
 
 void PushUndoAction(edit_context *E, m_arena *Arena, cursor *Cursor, undo_type Type, str8 InsertedOrRemovedText)

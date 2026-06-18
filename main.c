@@ -45,14 +45,13 @@ typedef struct app_state
 
 	edit_context Edit;
 	editable_buffer Buffer;
-	cursor Cursor;
 
 	mm_mode Mode;
 	edit_context DialogEdit;
 	editable_buffer DialogBuffer;
-	cursor DialogCursor;
 
 	b32 Dragging;
+	b32 ShowDebug; // cmd+B: edit stats overlay (cursor count, bytes copied, timing)
 }
 app_state;
 
@@ -195,6 +194,8 @@ typedef struct editor_layout
 	int StartIndex;
 	int EndIndex;
 	v2i Range;
+	int LineStart;
+	int TotalLineCount;
 	v2f Origin;
 } editor_layout;
 
@@ -220,6 +221,8 @@ static editor_layout ComputeEditorLayout(editable_buffer *Buffer, v2i ViewportSi
 	Layout.Origin     = v2f(Margin,
 		(f32)ViewportSize.Y - Margin - Buffer->HeightInPixels + Fraction
 		+ (f32)LinesAbove * LineHeight);
+	Layout.LineStart = StartLine;
+	Layout.TotalLineCount = TotalLines;
 	return Layout;
 }
 
@@ -244,7 +247,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 	R_BeginFrame(&App->Render, ViewportSize);
 
 	editable_buffer *Buffer = &App->Buffer;
-	cursor *Cursor = &App->Cursor;
+	cursor *Cursor = &App->Edit.Cursors[0];
 
 	f32 Margin = 40.0f;
 	f32 LineHeight = D_LineHeightFromFont(App->Font, Buffer->HeightInPixels);
@@ -275,8 +278,12 @@ static void Frame(void *UserData, v2i ViewportSize)
 
 	v2i DialogRange = v2i(0, (s32)Dialog->Length);
 
+	// Remember where the primary caret was, so we can scroll to follow it
+	// after input — but only if it actually moved (not on scroll-wheel).
+	s32 CaretBefore = Cursor->Selection.Y;
+
 	v2f CaretLocal = E_GetVisualPositionFromEditableBuffer(&App->DialogEdit, &App->Draw,
-		App->DialogCursor.Selection.Y, *Dialog, App->Font, DialogRange, v2f(0, 0));
+		App->DialogEdit.Cursors[0].Selection.Y, *Dialog, App->Font, DialogRange, v2f(0, 0));
 	f32 DialogScroll = Max(0.0f, CaretLocal.X - ClipWidth*0.5f);
 	v2f DialogOrigin = v2f(ClipLeft - DialogScroll, TextY);
 
@@ -288,7 +295,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 		b32 InDialog = (App->Mode == MM_OPEN_DIALOG);
 		edit_context    *ActiveEdit   = InDialog ? &App->DialogEdit   : &App->Edit;
 		editable_buffer *ActiveBuffer = InDialog ? &App->DialogBuffer : &App->Buffer;
-		cursor          *ActiveCursor = InDialog ? &App->DialogCursor : &App->Cursor;
+		cursor          *ActiveCursor = InDialog ? &App->DialogEdit.Cursors[0] : &App->Edit.Cursors[0];
 		s64              ActiveCap    = InDialog ? DIALOG_CHUNK_SIZE   : EDIT_CHUNK_SIZE;
 		v2f              ActiveOrigin = InDialog ? DialogOrigin : Origin;
 		v2i              ActiveRange  = InDialog ? DialogRange  : Range;
@@ -304,10 +311,10 @@ static void Frame(void *UserData, v2i ViewportSize)
 			int Index = IndexFromMouse(App, ActiveEdit, ActiveBuffer, ActiveOrigin, ActiveRange, Mouse);
 			if (OS_KeyDown(OS_KEY_OPTION))
 			{
-				cursor *Last = E_LastCursor(ActiveCursor);
+				cursor *Last = E_LastCursor(ActiveEdit);
 				cursor NextCursor = *Last;
 				NextCursor.Selection = v2i(Index, Index);
-				E_AppendCursor(ActiveEdit, ActiveEdit->Arena, ActiveCursor, NextCursor);
+				E_AppendCursor(ActiveEdit, ActiveEdit->Arena, NextCursor);
 			}
 			else if (OS_KeyDown(OS_KEY_SHIFT))
 			{
@@ -315,7 +322,6 @@ static void Frame(void *UserData, v2i ViewportSize)
 			}
 			else
 			{
-				ActiveCursor->Next = Null; // collapse back to a single cursor
 				ActiveCursor->Selection = v2i(Index, Index);
 			}
 			App->Dragging = !OS_KeyDown(OS_KEY_OPTION);
@@ -345,25 +351,25 @@ static void Frame(void *UserData, v2i ViewportSize)
 		{
 			App->Mode = MM_OPEN_DIALOG;
 			App->DialogBuffer.Length = 0;
-			App->DialogCursor = (cursor){0};
+			App->DialogEdit.CursorCount = 1;
+			App->DialogEdit.Cursors[0] = (cursor){0};
+			continue;
+		}
+		if (Cmd && Key == OS_KEY_B)
+		{
+			App->ShowDebug = !App->ShowDebug;
 			continue;
 		}
 		if (App->Mode == MM_OPEN_DIALOG && (Key == OS_KEY_ESCAPE || Key == OS_KEY_RETURN))
 		{
 			if(Key == OS_KEY_RETURN)
 			{
-				// Copy the file into the fixed-capacity Chunk rather than
-				// repointing Buffer->AsString at the tight file allocation:
-				// E_InsertTo ping-pongs Chunk<->ScratchChunk, so both must
-				// stay EDIT_CHUNK_SIZE or a later swap leaves ScratchChunk
-				// undersized and the next insert overruns it.
 				str8 File = OS_LoadEntireFileIntoMemory(App->Permanent, App->DialogBuffer.AsString);
 				if (File.Size < EDIT_CHUNK_SIZE)
 				{
 					MemoryCopy(Buffer->Chunk, File.Bytes, File.Size);
 					Buffer->Length = File.Size;
 					Cursor->Selection = v2i(0, 0);
-					Cursor->Next = Null;
 				}
 				else
 				{
@@ -379,14 +385,13 @@ static void Frame(void *UserData, v2i ViewportSize)
 		{
 			switch (Key)
 			{
-				case OS_KEY_A: // select all
-					ActiveCursor->Next = Null;
+				case OS_KEY_A:
 					ActiveCursor->Selection = v2i(0, ActiveBuffer->AsString.Size);
 					break;
 				case OS_KEY_L:
 				{
 					v2i Sel = E_GetSortedSelection(ActiveCursor->Selection);
-					ActiveCursor->Next = Null;
+					ActiveEdit->CursorCount = 1;
 					cursor *Tail = ActiveCursor;
 					b32 First = True;
 					for (int I = Sel.X; ; )
@@ -407,8 +412,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 						{
 							cursor NextCursor = *Tail;
 							NextCursor.Selection = v2i(LineEnd, LineEnd);
-							E_AppendCursor(ActiveEdit, ActiveEdit->Arena, Tail, NextCursor);
-							Tail = Tail->Next;
+							E_AppendCursor(ActiveEdit, ActiveEdit->Arena, NextCursor);
 						}
 
 						if (LineEnd >= Sel.Y) break;
@@ -427,14 +431,19 @@ static void Frame(void *UserData, v2i ViewportSize)
 					edit_movement Move = (Key == OS_KEY_UP) ? E_MOVE_UP : E_MOVE_DOWN;
 					if (Alt)
 					{
-						cursor *Last = E_LastCursor(ActiveCursor);
-						cursor NextCursor = *Last;
-						E_AppendCursor(ActiveEdit, ActiveEdit->Arena, ActiveCursor, NextCursor);
-						E_MoveCursors(ActiveEdit, &App->Draw, App->Font, E_LastCursor(ActiveCursor), ActiveBuffer, Move, MoveType);
+						// Duplicate the last cursor and move only the new copy,
+						// so alt+up/down stacks carets on adjacent lines.
+						E_AppendCursor(ActiveEdit, ActiveEdit->Arena, *E_LastCursor(ActiveEdit));
+						cursor *New = E_LastCursor(ActiveEdit);
+						E_MoveCursors(ActiveEdit, &App->Draw, App->Font, New, ActiveBuffer, Move, MoveType);
 					}
 					else
 					{
-						E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, Move, MoveType);
+						// cmd+up / cmd+down: jump to the start / end of the buffer.
+						// shift extends the selection from the current anchor.
+						s32 Target = (Key == OS_KEY_UP) ? 0 : (s32)ActiveBuffer->AsString.Size;
+						ActiveCursor->Selection.Y = Target;
+						if (!Shift) ActiveCursor->Selection.X = Target;
 					}
 				} break;
 				case OS_KEY_DELETE:
@@ -468,14 +477,14 @@ static void Frame(void *UserData, v2i ViewportSize)
 				break;
 
 			case OS_KEY_ESCAPE:
-				ActiveCursor->Next = Null;
+				ActiveEdit->CursorCount = 1;
 				ActiveCursor->Selection.X = ActiveCursor->Selection.Y;
 				break;
 
 			default:
 			{
 				u32 Char = CharFromKeyCode(Key, Shift);
-				s64 InsertCount = E_CursorCount(ActiveCursor);
+				s64 InsertCount = ActiveEdit->CursorCount;
 				if (Char && ActiveBuffer->Length + InsertCount < ActiveCap)
 				{
 					u8 Bytes[1] = { (u8)Char };
@@ -486,18 +495,64 @@ static void Frame(void *UserData, v2i ViewportSize)
 		}
 	}
 
+	// Scroll the view to keep the primary caret visible when it moved.
+	// Only with a single cursor: multi-caret ops (e.g. cmd+L puts a caret on
+	// every selected line) park the head caret on the first line, which would
+	// otherwise yank the view to the top.
+	if (Cursor->Selection.Y != CaretBefore)
+	{
+		str8 BeforeCaret = { (s64)Cursor->Selection.Y, Buffer->AsString.Bytes };
+		f32 CaretTop = (f32)CountNewLines(BeforeCaret) * LineHeight;
+		f32 VisibleHeight = (f32)ViewportSize.Y - 2.0f * Margin;
+		if (CaretTop < Buffer->Offset.Y)
+			Buffer->Offset.Y = CaretTop;
+		else if (CaretTop + LineHeight > Buffer->Offset.Y + VisibleHeight)
+			Buffer->Offset.Y = CaretTop + LineHeight - VisibleHeight;
+	}
+
 	Layout     = ComputeEditorLayout(Buffer, ViewportSize, Margin, LineHeight);
 	StartIndex = Layout.StartIndex;
 	EndIndex   = Layout.EndIndex;
 	Range      = Layout.Range;
 	Origin     = Layout.Origin;
 
+
+	int TotalLineCount = Layout.TotalLineCount;
+	int NumberDigitCount = (Layout.TotalLineCount == 0) ? 1 : 0;
+	while (TotalLineCount != 0)
+	{
+		TotalLineCount /= 10;
+		if (TotalLineCount != 0 || NumberDigitCount == 0)
+		{
+			NumberDigitCount++;
+		}
+	}
+	f32 LineNumbersWidth = (NumberDigitCount + 1) * D_Str8WidthFromHeight(App->Font, Str8("0"), Buffer->HeightInPixels);
+
 	// --- Render ------------------------------------------------------------
 	D_Quad(&App->Draw, v2f(0, 0), (f32)ViewportSize.X, (f32)ViewportSize.Y,
 		.Colour = COLOUR_BG);
 
-	for (cursor *C = Cursor; C; C = C->Next)
+	for(int I = ViewportSize.Y/Buffer->HeightInPixels; I >= 0; I--)
 	{
+		if(I + Layout.LineStart >= Layout.TotalLineCount) continue;
+		str8 LineAsString = Str8PushF(TemporaryArena(), "?s32", Layout.LineStart + I + 1);
+		D_Str8(&App->Draw, LineAsString,
+			.Font = App->Font,
+			.Position = v3f(Origin.X, Origin.Y - I * Buffer->HeightInPixels, 0),
+			.HeightInPixels = Buffer->HeightInPixels,
+			.Colour = COLOUR_TEXT,
+		);
+	}
+	
+	D_Line(&App->Draw, v2f(LineNumbersWidth + 25 + Origin.X, 0), v2f(LineNumbersWidth + 25 + Origin.X, ViewportSize.Y), 1.0, COLOUR_TEXT);
+
+	Origin.X += LineNumbersWidth + 50;
+
+
+	for (int I = 0; I < App->Edit.CursorCount; I++)
+	{
+		cursor *C = App->Edit.Cursors + I;
 		DrawSelection(App, Buffer, Origin, Range, E_GetSortedSelection(C->Selection));
 	}
 
@@ -512,8 +567,9 @@ static void Frame(void *UserData, v2i ViewportSize)
 		.HighlightStart = Primary.X - StartIndex,
 		.HighlightEnd = Primary.Y - StartIndex);
 
-	for (cursor *C = Cursor; C; C = C->Next)
+	for (int I = 0; I < App->Edit.CursorCount; I++)
 	{
+		cursor *C = App->Edit.Cursors + I;
 		if (C->Selection.Y < Range.X || C->Selection.Y > Range.Y) continue;
 		v2f CaretPos = E_GetVisualPositionFromEditableBuffer(&App->Edit, &App->Draw,
 			C->Selection.Y, *Buffer, App->Font, Range, Origin);
@@ -534,7 +590,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 		R_PushScissor(&App->Render, v4i((s32)ClipLeft, (s32)FileDialogPos.Y,
 			(s32)ClipWidth, (s32)FileDialogSize.Y));
 
-		v2i Sel = E_GetSortedSelection(App->DialogCursor.Selection);
+		v2i Sel = E_GetSortedSelection(App->DialogEdit.Cursors[0].Selection);
 		DrawSelection(App, Dialog, DialogOrigin, DialogRange, Sel);
 		D_Str8(&App->Draw, Dialog->AsString, .Font = App->Font,
 			.Position = v3f(DialogOrigin.X, DialogOrigin.Y, 0),
@@ -545,11 +601,53 @@ static void Frame(void *UserData, v2i ViewportSize)
 			.HighlightEnd = Sel.Y);
 
 		v2f Caret = E_GetVisualPositionFromEditableBuffer(&App->DialogEdit, &App->Draw,
-			App->DialogCursor.Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
+			App->DialogEdit.Cursors[0].Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
 		D_Quad(&App->Draw, v2f(Caret.X, Caret.Y), 4.0f, LineHeight,
 			.Colour = COLOUR_ACCENT);
 
 		R_PopScissor(&App->Render);
+	}
+
+	if (App->ShowDebug)
+	{
+		edit_context *Edit = &App->Edit;
+		f32 DebugHeight = 40.0f;
+		f32 DebugScale  = stbtt_ScaleForPixelHeight(&App->Font.Info, DebugHeight);
+		f32 DebugLineH  = D_LineHeightFromFont(App->Font, DebugHeight);
+		f32 DebugPad    = 12.0f;
+
+		str8 Lines[5];
+		Lines[0] = Str8("edit debug (cmd+b)");
+		Lines[1] = Str8PushF(Frame, "cursors:  ?s32", Edit->DebugCursorCount);
+		Lines[2] = Str8PushF(Frame, "copied:   ?s32 b", Edit->DebugBytesCopied);
+		Lines[3] = Str8PushF(Frame, "inserted: ?s32 b", Edit->DebugBytesInserted);
+		Lines[4] = Str8PushF(Frame, "time:     ?f32 ms", Edit->DebugTimeMs);
+		int LineCount = 5;
+
+		f32 MaxWidth = 0.0f;
+		for (int I = 0; I < LineCount; I++)
+		{
+			f32 W = D_Str8WidthFromHeight(App->Font, Lines[I], DebugHeight);
+			MaxWidth = Max(MaxWidth, W);
+		}
+
+		f32 BoxW = MaxWidth + 2.0f * DebugPad;
+		f32 BoxH = (f32)LineCount * DebugLineH + 2.0f * DebugPad;
+		v2f BoxPos = v2f(ViewportSize.X - Margin - BoxW, Margin);
+
+		D_Quad(&App->Draw, BoxPos, BoxW, BoxH,
+			.Colour = COLOUR_BG,
+			.OutlineColour = COLOUR_TEXT,
+			.OutlineThickness = 2.0);
+
+		f32 TextY = BoxPos.Y + BoxH - DebugPad - App->Font.Ascent * DebugScale;
+		for (int I = 0; I < LineCount; I++)
+		{
+			D_Str8(&App->Draw, Lines[I], .Font = App->Font,
+				.Position = v3f(BoxPos.X + DebugPad, TextY - (f32)I * DebugLineH, 0),
+				.HeightInPixels = DebugHeight,
+				.Colour = COLOUR_TEXT);
+		}
 	}
 
 	R_Update(&App->Render, OS_NextDrawable(App->Window));
@@ -590,7 +688,8 @@ int main(int ArgCount, char **Args)
 	App.Edit.Arena = Arena;
 	App.Edit.Draw = &App.Draw;
 	App.Edit.ScratchChunk = ArenaPushZero(Arena, EDIT_CHUNK_SIZE);
-	App.Edit.Cursors = &App.Cursor;
+	App.Edit.Cursors = ArenaPushArrayZero(Arena, cursor, MegaBytes(1));
+	App.Edit.CursorCount = 1;
 
 	App.Buffer.HeightInPixels = 50.0f;
 	App.Buffer.Chunk = ArenaPushZero(Arena, EDIT_CHUNK_SIZE);
@@ -599,7 +698,8 @@ int main(int ArgCount, char **Args)
 	App.DialogEdit.Arena = Arena;
 	App.DialogEdit.Draw = &App.Draw;
 	App.DialogEdit.ScratchChunk = ArenaPushZero(Arena, DIALOG_CHUNK_SIZE);
-	App.DialogEdit.Cursors = &App.DialogCursor;
+	App.DialogEdit.Cursors = ArenaPushArrayZero(Arena, cursor, MegaBytes(1));
+	App.DialogEdit.CursorCount = 1;
 
 	App.DialogBuffer.HeightInPixels = 50.0f;
 	App.DialogBuffer.Chunk = ArenaPushZero(Arena, DIALOG_CHUNK_SIZE);
