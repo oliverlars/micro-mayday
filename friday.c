@@ -7,6 +7,7 @@ Build system for the-thing — a minimal Metal renderer.
 Usage:
 	./friday          build (debug)
 	./friday run      build then launch
+	./friday profile  build then capture a 10s Time Profiler trace (xctrace)
 	./friday release  optimised build (-O2)
 	./friday rebuild  force full rebuild
 	./friday help     print this
@@ -26,6 +27,7 @@ Entry(InputWaveInfo)
 	build_options BuildOptions = {0};
 	b32 PrintHelpMenu = False;
 	b32 ShouldRun = False;
+	b32 ShouldProfile = False;
 
 	if(WaveIsFirstLane(WaveInfo))
 	{
@@ -39,11 +41,13 @@ Entry(InputWaveInfo)
 			else if(Str8Equal(Arg, Str8("release"))) { OptimisedBuild = True; }
 			else if(Str8Equal(Arg, Str8("rebuild"))) { Rebuild = True; }
 			else if(Str8Equal(Arg, Str8("run")))     { ShouldRun = True; }
+			else if(Str8Equal(Arg, Str8("profile"))) { ShouldProfile = True; }
 			else if(Str8Equal(Arg, Str8("help")))
 			{
 				printf("\nfriday — build system for the-thing\n\n");
 				printf("Flags:\n");
 				printf("  run       build, then launch the binary\n");
+				printf("  profile   build, then capture a Time Profiler trace via xctrace\n");
 				printf("  release   optimised build (-O2)\n");
 				printf("  rebuild   force full rebuild (ignore object cache)\n");
 				printf("  help      print this menu\n\n");
@@ -105,11 +109,29 @@ Entry(InputWaveInfo)
 	BroadcastToAllLanes(WaveInfo, BuildOptions);
 	BroadcastToAllLanes(WaveInfo, PrintHelpMenu);
 	BroadcastToAllLanes(WaveInfo, ShouldRun);
+	BroadcastToAllLanes(WaveInfo, ShouldProfile);
 
 	b32 FailedToBuild = False;
 	if(!PrintHelpMenu)
 	{
 		FailedToBuild = Build(WaveInfo, &Arena, BuildOptions);
+	}
+
+	if(WaveIsFirstLane(WaveInfo) && ShouldProfile && !FailedToBuild)
+	{
+		str8 ProfileCommand = Str8PushF(&Arena,
+			"rm -rf %.*smicro-mayday.trace && "
+			"xctrace record --template 'Time Profiler' "
+			"--output %.*smicro-mayday.trace --time-limit 10s "
+			"--launch -- %.*s%.*s ; "
+			"open %.*smicro-mayday.trace",
+			Str8ToPrintfArgs(BuildOptions.OutputPath),
+			Str8ToPrintfArgs(BuildOptions.OutputPath),
+			Str8ToPrintfArgs(BuildOptions.OutputPath),
+			Str8ToPrintfArgs(BuildOptions.OutputName),
+			Str8ToPrintfArgs(BuildOptions.OutputPath));
+		printf("\nProfiling the-thing (10s)...\n\n");
+		system(CStrFromStr8(&Arena, ProfileCommand));
 	}
 
 	if(WaveIsFirstLane(WaveInfo) && ShouldRun && !FailedToBuild)
