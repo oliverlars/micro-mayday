@@ -64,11 +64,8 @@ typedef struct app_state
 	cursor DialogCursor;
 
 	b32 Dragging;
-	b32 ShowDebug; // cmd+B: edit stats overlay (cursor count, bytes copied, timing)
-
-	// Layout computed at the end of last frame. Input is hit-tested against
-	// this (a frame behind), then we recompute and stash it again for the
-	// next frame. Its Origin already bakes in the scroll offset / line start.
+	b32 ShowDebug;
+	
 	editor_layout Layout;
 }
 app_state;
@@ -247,6 +244,264 @@ static editor_layout ComputeEditorLayout(editable_buffer *Buffer, d_font Font, i
 	return Layout;
 }
 
+static void HandleEditorInput(app_state *App, os_event Event, v2f Origin, v2i Range)
+{
+	edit_context    *Edit   = &App->Edit;
+	editable_buffer *Buffer = &App->Buffer;
+	cursor          *ActiveCursor = &Edit->Cursors[0];
+	v2f Mouse = Event.MousePosition;
+
+	if (Event.Type == OS_EVENT_MOUSE_DOWN && Event.KeyCode == OS_MOUSE_LEFT)
+	{
+		int Index = IndexFromMouse(App, Edit, Buffer, Origin, Range, Mouse);
+		b32 AddCursor = OS_KeyDown(OS_KEY_OPTION);
+		if (AddCursor)
+		{
+			cursor *Last = E_LastCursor(Edit);
+			cursor NextCursor = *Last;
+			NextCursor.Selection = v2i(Index, Index);
+			E_AppendCursor(Edit, Edit->Arena, NextCursor);
+		}
+		else if (OS_KeyDown(OS_KEY_SHIFT))
+			ActiveCursor->Selection.Y = Index;
+		else
+			ActiveCursor->Selection = v2i(Index, Index);
+		App->Dragging = !AddCursor;
+		return;
+	}
+	if (Event.Type == OS_EVENT_MOUSE_MOVE && App->Dragging)
+	{
+		ActiveCursor->Selection.Y = IndexFromMouse(App, Edit, Buffer, Origin, Range, Mouse);
+		return;
+	}
+	if (Event.Type == OS_EVENT_MOUSE_UP && Event.KeyCode == OS_MOUSE_LEFT)
+	{
+		App->Dragging = False;
+		return;
+	}
+
+	if (Event.Type == OS_EVENT_KEY_DOWN)
+	{
+		b32 Shift = OS_KeyDown(OS_KEY_SHIFT);
+		b32 Cmd   = OS_KeyDown(OS_KEY_COMMAND);
+		b32 Alt   = OS_KeyDown(OS_KEY_OPTION);
+		edit_move_type MoveType = Shift ? E_MOVE_SELECTING : E_MOVE_NOT_SELECTING;
+		int Key = Event.KeyCode;
+
+		if (Cmd)
+		{
+			switch (Key)
+			{
+				case OS_KEY_A:
+					ActiveCursor->Selection = v2i(0, Buffer->AsString.Size);
+					break;
+				case OS_KEY_L:
+				{
+					v2i Sel = E_GetSortedSelection(ActiveCursor->Selection);
+					Edit->CursorCount = 1;
+					cursor *Tail = ActiveCursor;
+					b32 First = True;
+					for (int I = Sel.X; ; )
+					{
+						int LineEnd = I;
+						while (LineEnd < Buffer->Length && Buffer->Chunk[LineEnd] != '\n')
+							LineEnd++;
+
+						if (First)
+						{
+							ActiveCursor->Selection = v2i(LineEnd, LineEnd);
+							First = False;
+						}
+						else
+						{
+							cursor NextCursor = *Tail;
+							NextCursor.Selection = v2i(LineEnd, LineEnd);
+							E_AppendCursor(Edit, Edit->Arena, NextCursor);
+						}
+
+						if (LineEnd >= Sel.Y) break;
+						I = LineEnd + 1;
+					}
+				} break;
+				case OS_KEY_LEFT:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_LINE_START, MoveType);
+					break;
+				case OS_KEY_RIGHT:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_LINE_END, MoveType);
+					break;
+				case OS_KEY_UP:
+				case OS_KEY_DOWN:
+				{
+					edit_movement Move = (Key == OS_KEY_UP) ? E_MOVE_UP : E_MOVE_DOWN;
+					if (Alt)
+					{
+						// Duplicate the last cursor and move only the new copy,
+						// so alt+up/down stacks carets on adjacent lines.
+						E_AppendCursor(Edit, Edit->Arena, *E_LastCursor(Edit));
+						cursor *New = E_LastCursor(Edit);
+						E_MoveCursors(Edit, &App->Draw, App->Font, New, Buffer, Move, MoveType);
+					}
+					else
+					{
+						// cmd+up / cmd+down: jump to the start / end of the buffer.
+						// shift extends the selection from the current anchor.
+						s32 Target = (Key == OS_KEY_UP) ? 0 : (s32)Buffer->AsString.Size;
+						ActiveCursor->Selection.Y = Target;
+						if (!Shift) ActiveCursor->Selection.X = Target;
+					}
+				} break;
+				case OS_KEY_DELETE:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_WORD_LEFT, E_MOVE_SELECTING);
+					E_DeleteTo(Edit, ActiveCursor, Buffer);
+					break;
+				default: break;
+			}
+			return;
+		}
+
+		switch (Key)
+		{
+			case OS_KEY_LEFT:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer,
+					Alt ? E_MOVE_WORD_LEFT : E_MOVE_LEFT, MoveType);
+				break;
+			case OS_KEY_RIGHT:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer,
+					Alt ? E_MOVE_WORD_RIGHT : E_MOVE_RIGHT, MoveType);
+				break;
+			case OS_KEY_UP:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_UP, MoveType);
+				break;
+			case OS_KEY_DOWN:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_DOWN, MoveType);
+				break;
+			case OS_KEY_DELETE:
+				E_DeleteTo(Edit, ActiveCursor, Buffer);
+				break;
+			case OS_KEY_ESCAPE:
+				Edit->CursorCount = 1;
+				ActiveCursor->Selection.X = ActiveCursor->Selection.Y;
+				break;
+			default:
+			{
+				u32 Char = CharFromKeyCode(Key, Shift);
+				s64 InsertCount = Edit->CursorCount;
+				if (Char && Buffer->Length + InsertCount < EDIT_CHUNK_SIZE)
+				{
+					u8 Bytes[1] = { (u8)Char };
+					str8 Text = { 1, Bytes };
+					E_InsertTo(Edit, ActiveCursor, Buffer, Text);
+				}
+			} break;
+		}
+	}
+}
+
+static void HandleDialogInput(app_state *App, os_event Event, v2f Origin, v2i Range)
+{
+	edit_context    *Edit   = &App->DialogEdit;
+	editable_buffer *Buffer = &App->DialogBuffer;
+	cursor          *ActiveCursor = &Edit->Cursors[0];
+	v2f Mouse = Event.MousePosition;
+
+	if (Event.Type == OS_EVENT_MOUSE_DOWN && Event.KeyCode == OS_MOUSE_LEFT)
+	{
+		int Index = IndexFromMouse(App, Edit, Buffer, Origin, Range, Mouse);
+		if (OS_KeyDown(OS_KEY_SHIFT))
+			ActiveCursor->Selection.Y = Index;
+		else
+			ActiveCursor->Selection = v2i(Index, Index);
+		App->Dragging = True;
+		return;
+	}
+	if (Event.Type == OS_EVENT_MOUSE_MOVE && App->Dragging)
+	{
+		ActiveCursor->Selection.Y = IndexFromMouse(App, Edit, Buffer, Origin, Range, Mouse);
+		return;
+	}
+	if (Event.Type == OS_EVENT_MOUSE_UP && Event.KeyCode == OS_MOUSE_LEFT)
+	{
+		App->Dragging = False;
+		return;
+	}
+
+	if (Event.Type == OS_EVENT_KEY_DOWN)
+	{
+		b32 Shift = OS_KeyDown(OS_KEY_SHIFT);
+		b32 Cmd   = OS_KeyDown(OS_KEY_COMMAND);
+		b32 Alt   = OS_KeyDown(OS_KEY_OPTION);
+		edit_move_type MoveType = Shift ? E_MOVE_SELECTING : E_MOVE_NOT_SELECTING;
+		int Key = Event.KeyCode;
+
+		if (Key == OS_KEY_ESCAPE || Key == OS_KEY_RETURN)
+		{
+			if (Key == OS_KEY_RETURN)
+			{
+				str8 File = OS_LoadEntireFileIntoMemory(App->Permanent, Buffer->AsString);
+				if (File.Size < EDIT_CHUNK_SIZE)
+				{
+					MemoryCopy(App->Buffer.Chunk, File.Bytes, File.Size);
+					App->Buffer.Length = File.Size;
+					App->Edit.Cursors[0].Selection = v2i(0, 0);
+				}
+				else
+				{
+					LogError("File too large for edit buffer: ?u64 bytes", (u64)File.Size);
+				}
+			}
+			App->Mode = MM_EDITOR;
+			return;
+		}
+
+		if (Cmd)
+		{
+			switch (Key)
+			{
+				case OS_KEY_A:
+					ActiveCursor->Selection = v2i(0, Buffer->AsString.Size);
+					break;
+				case OS_KEY_LEFT:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_LINE_START, MoveType);
+					break;
+				case OS_KEY_RIGHT:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_LINE_END, MoveType);
+					break;
+				case OS_KEY_DELETE:
+					E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer, E_MOVE_WORD_LEFT, E_MOVE_SELECTING);
+					E_DeleteTo(Edit, ActiveCursor, Buffer);
+					break;
+				default: break;
+			}
+			return;
+		}
+
+		switch (Key)
+		{
+			case OS_KEY_LEFT:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer,
+					Alt ? E_MOVE_WORD_LEFT : E_MOVE_LEFT, MoveType);
+				break;
+			case OS_KEY_RIGHT:
+				E_MoveCursors(Edit, &App->Draw, App->Font, ActiveCursor, Buffer,
+					Alt ? E_MOVE_WORD_RIGHT : E_MOVE_RIGHT, MoveType);
+				break;
+			case OS_KEY_DELETE:
+				E_DeleteTo(Edit, ActiveCursor, Buffer);
+				break;
+			default:
+			{
+				u32 Char = CharFromKeyCode(Key, Shift);
+				if (Char && Buffer->Length + 1 < DIALOG_CHUNK_SIZE)
+				{
+					u8 Bytes[1] = { (u8)Char };
+					str8 Text = { 1, Bytes };
+					E_InsertTo(Edit, ActiveCursor, Buffer, Text);
+				}
+			} break;
+		}
+	}
+}
+
 static void Frame(void *UserData, v2i ViewportSize)
 {
 	app_state *App = (app_state*)UserData;
@@ -275,9 +530,6 @@ static void Frame(void *UserData, v2i ViewportSize)
 
 	int TotalLines    = CountNewLines(Buffer->AsString) + 1;
 
-	// Input is hit-tested against the layout we computed at the end of the
-	// previous frame, so the editor area runs one frame behind. Its Origin
-	// already accounts for the scroll offset / first visible line.
 	editor_layout Layout = App->Layout;
 	v2i Range  = Layout.Range;
 	v2f Origin = Layout.Origin;
@@ -302,8 +554,6 @@ static void Frame(void *UserData, v2i ViewportSize)
 
 	v2i DialogRange = v2i(0, (s32)Dialog->Length);
 
-	// Remember where the primary caret was, so we can scroll to follow it
-	// after input — but only if it actually moved (not on scroll-wheel).
 	s32 CaretBefore = Cursor->Selection.Y;
 
 	v2f CaretLocal = E_GetVisualPositionFromEditableBuffer(&App->DialogEdit, &App->Draw,
@@ -314,208 +564,35 @@ static void Frame(void *UserData, v2i ViewportSize)
 	os_event Event;
 	while (OS_NextEvent(App->Window, &Event))
 	{
-		v2f Mouse = Event.MousePosition;
-
-		b32 InDialog = (App->Mode == MM_OPEN_DIALOG);
-		edit_context    *ActiveEdit   = InDialog ? &App->DialogEdit   : &App->Edit;
-		editable_buffer *ActiveBuffer = InDialog ? &App->DialogBuffer : &App->Buffer;
-		cursor          *ActiveCursor = InDialog ? &App->DialogEdit.Cursors[0] : &App->Edit.Cursors[0];
-		s64              ActiveCap    = InDialog ? DIALOG_CHUNK_SIZE   : EDIT_CHUNK_SIZE;
-		v2f              ActiveOrigin = InDialog ? DialogOrigin : Origin;
-		v2i              ActiveRange  = InDialog ? DialogRange  : Range;
-
 		if (Event.Type == OS_EVENT_SCROLL)
 		{
 			Buffer->Offset.Y -= Event.Scroll.Y * 2.0f;
 			continue;
 		}
-
-		if (Event.Type == OS_EVENT_MOUSE_DOWN && Event.KeyCode == OS_MOUSE_LEFT)
+		if (Event.Type == OS_EVENT_KEY_DOWN && OS_KeyDown(OS_KEY_COMMAND))
 		{
-			int Index = IndexFromMouse(App, ActiveEdit, ActiveBuffer, ActiveOrigin, ActiveRange, Mouse);
-			if (OS_KeyDown(OS_KEY_OPTION))
+			if (Event.KeyCode == OS_KEY_P)
 			{
-				cursor *Last = E_LastCursor(ActiveEdit);
-				cursor NextCursor = *Last;
-				NextCursor.Selection = v2i(Index, Index);
-				E_AppendCursor(ActiveEdit, ActiveEdit->Arena, NextCursor);
+				App->Mode = MM_OPEN_DIALOG;
+				App->DialogBuffer.Length = 0;
+				App->DialogEdit.CursorCount = 1;
+				App->DialogEdit.Cursors[0] = (cursor){0};
+				continue;
 			}
-			else if (OS_KeyDown(OS_KEY_SHIFT))
+			if (Event.KeyCode == OS_KEY_B)
 			{
-				ActiveCursor->Selection.Y = Index;
+				App->ShowDebug = !App->ShowDebug;
+				continue;
 			}
-			else
-			{
-				ActiveCursor->Selection = v2i(Index, Index);
-			}
-			App->Dragging = !OS_KeyDown(OS_KEY_OPTION);
-			continue;
-		}
-		if (Event.Type == OS_EVENT_MOUSE_MOVE && App->Dragging)
-		{
-			ActiveCursor->Selection.Y = IndexFromMouse(App, ActiveEdit, ActiveBuffer, ActiveOrigin, ActiveRange, Mouse);
-			continue;
-		}
-		if (Event.Type == OS_EVENT_MOUSE_UP && Event.KeyCode == OS_MOUSE_LEFT)
-		{
-			App->Dragging = False;
-			continue;
 		}
 
-		if (Event.Type != OS_EVENT_KEY_DOWN) continue;
-
-		b32 Shift = OS_KeyDown(OS_KEY_SHIFT);
-		b32 Cmd   = OS_KeyDown(OS_KEY_COMMAND);
-		b32 Alt   = OS_KeyDown(OS_KEY_OPTION);
-		edit_move_type MoveType = Shift ? E_MOVE_SELECTING : E_MOVE_NOT_SELECTING;
-		b32 Ctrl  = OS_KeyDown(OS_KEY_CONTROL);
-		int Key = Event.KeyCode;
-
-		if (Cmd && Key == OS_KEY_P)
+		if (App->Mode == MM_OPEN_DIALOG)
 		{
-			App->Mode = MM_OPEN_DIALOG;
-			App->DialogBuffer.Length = 0;
-			App->DialogEdit.CursorCount = 1;
-			App->DialogEdit.Cursors[0] = (cursor){0};
-			continue;
+			HandleDialogInput(App, Event, DialogOrigin, DialogRange);
 		}
-		if (Cmd && Key == OS_KEY_B)
+		else
 		{
-			App->ShowDebug = !App->ShowDebug;
-			continue;
-		}
-		if (App->Mode == MM_OPEN_DIALOG && (Key == OS_KEY_ESCAPE || Key == OS_KEY_RETURN))
-		{
-			if(Key == OS_KEY_RETURN)
-			{
-				str8 File = OS_LoadEntireFileIntoMemory(App->Permanent, App->DialogBuffer.AsString);
-				if (File.Size < EDIT_CHUNK_SIZE)
-				{
-					MemoryCopy(Buffer->Chunk, File.Bytes, File.Size);
-					Buffer->Length = File.Size;
-					Cursor->Selection = v2i(0, 0);
-				}
-				else
-				{
-					LogError("File too large for edit buffer: ?u64 bytes", (u64)File.Size);
-				}
-			}
-			App->Mode = MM_EDITOR;
-			continue;
-		}
-
-
-		if (Cmd)
-		{
-			switch (Key)
-			{
-				case OS_KEY_A:
-					ActiveCursor->Selection = v2i(0, ActiveBuffer->AsString.Size);
-					break;
-				case OS_KEY_L:
-				{
-					v2i Sel = E_GetSortedSelection(ActiveCursor->Selection);
-					ActiveEdit->CursorCount = 1;
-					cursor *Tail = ActiveCursor;
-					b32 First = True;
-					for (int I = Sel.X; ; )
-					{
-						int LineEnd = I;
-						while (LineEnd < ActiveBuffer->Length &&
-							ActiveBuffer->Chunk[LineEnd] != '\n')
-						{
-							LineEnd++;
-						}
-
-						if (First)
-						{
-							ActiveCursor->Selection = v2i(LineEnd, LineEnd);
-							First = False;
-						}
-						else
-						{
-							cursor NextCursor = *Tail;
-							NextCursor.Selection = v2i(LineEnd, LineEnd);
-							E_AppendCursor(ActiveEdit, ActiveEdit->Arena, NextCursor);
-						}
-
-						if (LineEnd >= Sel.Y) break;
-						I = LineEnd + 1;
-					}
-				} break;
-				case OS_KEY_LEFT:
-					E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, E_MOVE_LINE_START, MoveType);
-					break;
-				case OS_KEY_RIGHT:
-					E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, E_MOVE_LINE_END, MoveType);
-					break;
-				case OS_KEY_UP:
-				case OS_KEY_DOWN:
-				{
-					edit_movement Move = (Key == OS_KEY_UP) ? E_MOVE_UP : E_MOVE_DOWN;
-					if (Alt)
-					{
-						// Duplicate the last cursor and move only the new copy,
-						// so alt+up/down stacks carets on adjacent lines.
-						E_AppendCursor(ActiveEdit, ActiveEdit->Arena, *E_LastCursor(ActiveEdit));
-						cursor *New = E_LastCursor(ActiveEdit);
-						E_MoveCursors(ActiveEdit, &App->Draw, App->Font, New, ActiveBuffer, Move, MoveType);
-					}
-					else
-					{
-						// cmd+up / cmd+down: jump to the start / end of the buffer.
-						// shift extends the selection from the current anchor.
-						s32 Target = (Key == OS_KEY_UP) ? 0 : (s32)ActiveBuffer->AsString.Size;
-						ActiveCursor->Selection.Y = Target;
-						if (!Shift) ActiveCursor->Selection.X = Target;
-					}
-				} break;
-				case OS_KEY_DELETE:
-					E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, E_MOVE_WORD_LEFT, E_MOVE_SELECTING);
-					E_DeleteTo(ActiveEdit, ActiveCursor, ActiveBuffer);
-					break;
-				default: break;
-			}
-			continue;
-		}
-
-		switch (Key)
-		{
-			case OS_KEY_LEFT:
-				E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer,
-					Alt ? E_MOVE_WORD_LEFT : E_MOVE_LEFT, MoveType);
-				break;
-			case OS_KEY_RIGHT:
-				E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer,
-					Alt ? E_MOVE_WORD_RIGHT : E_MOVE_RIGHT, MoveType);
-				break;
-			case OS_KEY_UP:
-				E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, E_MOVE_UP, MoveType);
-				break;
-			case OS_KEY_DOWN:
-				E_MoveCursors(ActiveEdit, &App->Draw, App->Font, ActiveCursor, ActiveBuffer, E_MOVE_DOWN, MoveType);
-				break;
-
-			case OS_KEY_DELETE:
-				E_DeleteTo(ActiveEdit, ActiveCursor, ActiveBuffer);
-				break;
-
-			case OS_KEY_ESCAPE:
-				ActiveEdit->CursorCount = 1;
-				ActiveCursor->Selection.X = ActiveCursor->Selection.Y;
-				break;
-
-			default:
-			{
-				u32 Char = CharFromKeyCode(Key, Shift);
-				s64 InsertCount = ActiveEdit->CursorCount;
-				if (Char && ActiveBuffer->Length + InsertCount < ActiveCap)
-				{
-					u8 Bytes[1] = { (u8)Char };
-					str8 Text = { 1, Bytes };
-					E_InsertTo(ActiveEdit, ActiveCursor, ActiveBuffer, Text);
-				}
-			} break;
+			HandleEditorInput(App, Event, Origin, Range);
 		}
 	}
 
@@ -597,7 +674,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 		R_PushScissor(&App->Render, v4i((s32)ClipLeft, (s32)FileDialogPos.Y,
 			(s32)ClipWidth, (s32)FileDialogSize.Y));
 
-		v2i Sel = E_GetSortedSelection(App->DialogCursor.Selection);
+		v2i Sel = E_GetSortedSelection(App->DialogEdit.Cursors[0].Selection);
 		DrawSelection(App, Dialog, DialogOrigin, DialogRange, Sel);
 		D_Str8(&App->Draw, Dialog->AsString, .Font = App->Font,
 			.Position = v3f(DialogOrigin.X, DialogOrigin.Y, 0),
@@ -608,7 +685,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 			.HighlightEnd = Sel.Y);
 
 		v2f Caret = E_GetVisualPositionFromEditableBuffer(&App->DialogEdit, &App->Draw,
-			App->DialogCursor.Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
+			App->DialogEdit.Cursors[0].Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
 		D_Quad(&App->Draw, v2f(Caret.X, Caret.Y), 4.0f, LineHeight,
 			.Colour = COLOUR_ACCENT);
 
