@@ -31,6 +31,17 @@ typedef enum mm_mode
 	MM_OPEN_DIALOG,
 } mm_mode;
 
+typedef struct editor_layout
+{
+	int StartIndex;
+	int EndIndex;
+	v2i Range;
+	int LineStart;
+	int TotalLineCount;
+	v2f Origin;
+	f32 LineNumbersWidth;
+} editor_layout;
+
 typedef struct app_state
 {
 	m_arena *FrameArenas[2];
@@ -45,13 +56,20 @@ typedef struct app_state
 
 	edit_context Edit;
 	editable_buffer Buffer;
+	cursor Cursor;
 
 	mm_mode Mode;
 	edit_context DialogEdit;
 	editable_buffer DialogBuffer;
+	cursor DialogCursor;
 
 	b32 Dragging;
 	b32 ShowDebug; // cmd+B: edit stats overlay (cursor count, bytes copied, timing)
+
+	// Layout computed at the end of last frame. Input is hit-tested against
+	// this (a frame behind), then we recompute and stash it again for the
+	// next frame. Its Origin already bakes in the scroll offset / line start.
+	editor_layout Layout;
 }
 app_state;
 
@@ -189,22 +207,11 @@ static int IndexFromMouse(app_state *App, edit_context *Edit, editable_buffer *B
 		Range, Origin, v2i((s32)Mouse.X, (s32)Mouse.Y));
 }
 
-typedef struct editor_layout
-{
-	int StartIndex;
-	int EndIndex;
-	v2i Range;
-	int LineStart;
-	int TotalLineCount;
-	v2f Origin;
-} editor_layout;
-
-static editor_layout ComputeEditorLayout(editable_buffer *Buffer, v2i ViewportSize,
+static editor_layout ComputeEditorLayout(editable_buffer *Buffer, d_font Font, int TotalLineCount, v2i ViewportSize,
 										 f32 Margin, f32 LineHeight)
 {
-	int TotalLines    = CountNewLines(Buffer->AsString) + 1;
 	f32 VisibleHeight = (f32)ViewportSize.Y - 2.0f * Margin;
-	f32 MaxOffsetY    = Max(0.0f, (f32)TotalLines * LineHeight - VisibleHeight);
+	f32 MaxOffsetY    = Max(0.0f, (f32)TotalLineCount * LineHeight - VisibleHeight);
 	Buffer->Offset.Y  = ClampF32(Buffer->Offset.Y, 0.0f, MaxOffsetY);
 
 	int FirstLine  = (int)(Buffer->Offset.Y / LineHeight);
@@ -214,15 +221,29 @@ static editor_layout ComputeEditorLayout(editable_buffer *Buffer, v2i ViewportSi
 	int LinesAbove = Min(FirstLine, 1);
 	int StartLine  = FirstLine - LinesAbove;
 
+	int DigitCounter = TotalLineCount;
+	int NumberDigitCount = (DigitCounter == 0) ? 1 : 0;
+	while (DigitCounter != 0)
+	{
+		DigitCounter /= 10;
+		if (DigitCounter != 0 || NumberDigitCount == 0)
+		{
+			NumberDigitCount++;
+		}
+	}
+	f32 LineNumbersWidth = (NumberDigitCount + 1) * D_Str8WidthFromHeight(Font, Str8("0"), Buffer->HeightInPixels);
+
 	editor_layout Layout;
 	Layout.StartIndex = IndexFromLine(Buffer->AsString, StartLine);
 	Layout.EndIndex   = IndexFromLine(Buffer->AsString, FirstLine + LineSpan);
 	Layout.Range      = v2i(Layout.StartIndex, Layout.EndIndex);
-	Layout.Origin     = v2f(Margin,
-		(f32)ViewportSize.Y - Margin - Buffer->HeightInPixels + Fraction
-		+ (f32)LinesAbove * LineHeight);
+	Layout.Origin     = v2f(
+		Margin + LineNumbersWidth + 50,
+		(f32)ViewportSize.Y - Margin - Buffer->HeightInPixels + Fraction + (f32)LinesAbove * LineHeight
+	);
 	Layout.LineStart = StartLine;
-	Layout.TotalLineCount = TotalLines;
+	Layout.TotalLineCount = TotalLineCount;
+	Layout.LineNumbersWidth = LineNumbersWidth;
 	return Layout;
 }
 
@@ -252,11 +273,14 @@ static void Frame(void *UserData, v2i ViewportSize)
 	f32 Margin = 40.0f;
 	f32 LineHeight = D_LineHeightFromFont(App->Font, Buffer->HeightInPixels);
 
-	editor_layout Layout = ComputeEditorLayout(Buffer, ViewportSize, Margin, LineHeight);
-	int StartIndex = Layout.StartIndex;
-	int EndIndex   = Layout.EndIndex;
-	v2i Range      = Layout.Range;
-	v2f Origin     = Layout.Origin;
+	int TotalLines    = CountNewLines(Buffer->AsString) + 1;
+
+	// Input is hit-tested against the layout we computed at the end of the
+	// previous frame, so the editor area runs one frame behind. Its Origin
+	// already accounts for the scroll offset / first visible line.
+	editor_layout Layout = App->Layout;
+	v2i Range  = Layout.Range;
+	v2f Origin = Layout.Origin;
 
 
 	editable_buffer *Dialog = &App->DialogBuffer;
@@ -495,10 +519,6 @@ static void Frame(void *UserData, v2i ViewportSize)
 		}
 	}
 
-	// Scroll the view to keep the primary caret visible when it moved.
-	// Only with a single cursor: multi-caret ops (e.g. cmd+L puts a caret on
-	// every selected line) park the head caret on the first line, which would
-	// otherwise yank the view to the top.
 	if (Cursor->Selection.Y != CaretBefore)
 	{
 		str8 BeforeCaret = { (s64)Cursor->Selection.Y, Buffer->AsString.Bytes };
@@ -510,28 +530,16 @@ static void Frame(void *UserData, v2i ViewportSize)
 			Buffer->Offset.Y = CaretTop + LineHeight - VisibleHeight;
 	}
 
-	Layout     = ComputeEditorLayout(Buffer, ViewportSize, Margin, LineHeight);
-	StartIndex = Layout.StartIndex;
-	EndIndex   = Layout.EndIndex;
-	Range      = Layout.Range;
-	Origin     = Layout.Origin;
+	Layout      = ComputeEditorLayout(Buffer, App->Font, TotalLines, ViewportSize, Margin, LineHeight);
+	App->Layout = Layout;
+	int StartIndex = Layout.StartIndex;
+	int EndIndex   = Layout.EndIndex;
+	Range  = Layout.Range;
+	Origin = Layout.Origin;
 
-
-	int TotalLineCount = Layout.TotalLineCount;
-	int NumberDigitCount = (Layout.TotalLineCount == 0) ? 1 : 0;
-	while (TotalLineCount != 0)
-	{
-		TotalLineCount /= 10;
-		if (TotalLineCount != 0 || NumberDigitCount == 0)
-		{
-			NumberDigitCount++;
-		}
-	}
-	f32 LineNumbersWidth = (NumberDigitCount + 1) * D_Str8WidthFromHeight(App->Font, Str8("0"), Buffer->HeightInPixels);
-
-	// --- Render ------------------------------------------------------------
 	D_Quad(&App->Draw, v2f(0, 0), (f32)ViewportSize.X, (f32)ViewportSize.Y,
 		.Colour = COLOUR_BG);
+
 
 	for(int I = ViewportSize.Y/Buffer->HeightInPixels; I >= 0; I--)
 	{
@@ -539,15 +547,14 @@ static void Frame(void *UserData, v2i ViewportSize)
 		str8 LineAsString = Str8PushF(TemporaryArena(), "?s32", Layout.LineStart + I + 1);
 		D_Str8(&App->Draw, LineAsString,
 			.Font = App->Font,
-			.Position = v3f(Origin.X, Origin.Y - I * Buffer->HeightInPixels, 0),
+			.Position = v3f(Margin, Origin.Y - I * Buffer->HeightInPixels, 0),
 			.HeightInPixels = Buffer->HeightInPixels,
 			.Colour = COLOUR_TEXT,
 		);
 	}
-	
-	D_Line(&App->Draw, v2f(LineNumbersWidth + 25 + Origin.X, 0), v2f(LineNumbersWidth + 25 + Origin.X, ViewportSize.Y), 1.0, COLOUR_TEXT);
 
-	Origin.X += LineNumbersWidth + 50;
+	f32 DividerX = Margin + Layout.LineNumbersWidth + 25;
+	D_Line(&App->Draw, v2f(DividerX, 0), v2f(DividerX, ViewportSize.Y), 1.0, COLOUR_TEXT);
 
 
 	for (int I = 0; I < App->Edit.CursorCount; I++)
@@ -590,7 +597,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 		R_PushScissor(&App->Render, v4i((s32)ClipLeft, (s32)FileDialogPos.Y,
 			(s32)ClipWidth, (s32)FileDialogSize.Y));
 
-		v2i Sel = E_GetSortedSelection(App->DialogEdit.Cursors[0].Selection);
+		v2i Sel = E_GetSortedSelection(App->DialogCursor.Selection);
 		DrawSelection(App, Dialog, DialogOrigin, DialogRange, Sel);
 		D_Str8(&App->Draw, Dialog->AsString, .Font = App->Font,
 			.Position = v3f(DialogOrigin.X, DialogOrigin.Y, 0),
@@ -601,7 +608,7 @@ static void Frame(void *UserData, v2i ViewportSize)
 			.HighlightEnd = Sel.Y);
 
 		v2f Caret = E_GetVisualPositionFromEditableBuffer(&App->DialogEdit, &App->Draw,
-			App->DialogEdit.Cursors[0].Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
+			App->DialogCursor.Selection.Y, *Dialog, App->Font, DialogRange, DialogOrigin);
 		D_Quad(&App->Draw, v2f(Caret.X, Caret.Y), 4.0f, LineHeight,
 			.Colour = COLOUR_ACCENT);
 

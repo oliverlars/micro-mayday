@@ -119,19 +119,24 @@ Entry(InputWaveInfo)
 
 	if(WaveIsFirstLane(WaveInfo) && ShouldProfile && !FailedToBuild)
 	{
-		str8 ProfileCommand = Str8PushF(&Arena,
-			"rm -rf %.*smicro-mayday.trace && "
-			"xctrace record --template 'Time Profiler' "
-			"--output %.*smicro-mayday.trace --time-limit 10s "
-			"--launch -- %.*s%.*s ; "
-			"open %.*smicro-mayday.trace",
-			Str8ToPrintfArgs(BuildOptions.OutputPath),
-			Str8ToPrintfArgs(BuildOptions.OutputPath),
-			Str8ToPrintfArgs(BuildOptions.OutputPath),
-			Str8ToPrintfArgs(BuildOptions.OutputName),
+		str8 TracePath = Str8PushF(&Arena, "%.*smicro-mayday.trace",
 			Str8ToPrintfArgs(BuildOptions.OutputPath));
+
 		printf("\nProfiling the-thing (10s)...\n\n");
-		system(CStrFromStr8(&Arena, ProfileCommand));
+		b32 Failed = False;
+
+		ExecuteCommand(&Arena, Str8PushF(&Arena, "rm -rf %.*s",
+			Str8ToPrintfArgs(TracePath)), &Failed);
+
+		ExecuteCommand(&Arena, Str8PushF(&Arena,
+			"xctrace record --template 'Time Profiler' --output %.*s "
+			"--time-limit 10s --launch -- %.*s%.*s",
+			Str8ToPrintfArgs(TracePath),
+			Str8ToPrintfArgs(BuildOptions.OutputPath),
+			Str8ToPrintfArgs(BuildOptions.OutputName)), &Failed);
+
+		ExecuteCommand(&Arena, Str8PushF(&Arena, "open %.*s",
+			Str8ToPrintfArgs(TracePath)), &Failed);
 	}
 
 	if(WaveIsFirstLane(WaveInfo) && ShouldRun && !FailedToBuild)

@@ -400,13 +400,35 @@ b32 ExecuteCommand(memory_arena *Arena, str8 EntireCommandAndArguments, b32 *Fai
 	for(u64 Index = 0; Index < EntireCommandAndArguments.Size; Index++, ArgumentIndex++)
 	{
 		GobbleWhitespace(EntireCommandAndArguments, &Index);
-		u64 IndexUpToWhitespace = Index;
-		GobbleUpToWhitespace(EntireCommandAndArguments, &IndexUpToWhitespace);
+		if(Index >= EntireCommandAndArguments.Size)
+		{
+			break;
+		}
+
 		str8 Argument = { 0 };
-		Argument.Bytes = EntireCommandAndArguments.Bytes + Index;
-		Argument.Size = IndexUpToWhitespace - Index;
+		if(EntireCommandAndArguments.Bytes[Index] == '\'')
+		{
+			// Single-quoted argument: keep the spaces inside, drop the quotes.
+			Index += 1;
+			u64 Start = Index;
+			while(Index < EntireCommandAndArguments.Size &&
+				  EntireCommandAndArguments.Bytes[Index] != '\'')
+			{
+				Index += 1;
+			}
+			Argument.Bytes = EntireCommandAndArguments.Bytes + Start;
+			Argument.Size = Index - Start;
+			// Index sits on the closing quote; the loop's Index++ steps past it.
+		}
+		else
+		{
+			u64 IndexUpToWhitespace = Index;
+			GobbleUpToWhitespace(EntireCommandAndArguments, &IndexUpToWhitespace);
+			Argument.Bytes = EntireCommandAndArguments.Bytes + Index;
+			Argument.Size = IndexUpToWhitespace - Index;
+			Index += Argument.Size;
+		}
 		CompilerArguments[ArgumentIndex] = CStrFromStr8(Arena, Argument);
-		Index += Argument.Size;
 	}
 
 	CompilerArguments[ArgumentIndex] = Null;
